@@ -22,7 +22,7 @@ setup(
     version=VERSION,
     description='nose plugin that picks a subset of your unit tests',
     classifiers=[
-        'License :: OSI Approved :: BSD License'
+        'License :: OSI Approved :: BSD License',
         'Programming Language :: Python :: 2.6',
         'Programming Language :: Python :: 2.7',
     ],
