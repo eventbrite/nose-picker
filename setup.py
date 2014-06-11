@@ -12,6 +12,7 @@ VERSION = '0.5.1'
 setup(
     name='nose-picker',
     version=VERSION,
+    description='nose plugin that picks a subset of your unit tests',
     classifiers=['License :: OSI Approved :: BSD License'],
     long_description=README,
     url='https://github.com/eventbrite/nose-picker',
