@@ -6,7 +6,7 @@ from setuptools import find_packages, setup
 
 here = os.path.abspath(os.path.dirname(__file__))
 README = open(os.path.join(here, 'README.rst')).read()
-VERSION = '0.5.1'
+VERSION = '0.5.2'
 
 
 if sys.argv[-1] == 'publish':
