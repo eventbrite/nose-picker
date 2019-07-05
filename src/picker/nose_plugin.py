@@ -88,16 +88,22 @@ class NosePicker(Plugin):
         self.enabled = getattr(options, self.enableOpt)
         self.total_processes = options.total_processes
         self.which_process = options.which_process
+
         if options.futz_with_django:
+            import django
             from django.db import connections
-            for alias in connections:
-                connection = connections[alias]
-                creation = connection.creation
-                connection.settings_dict['TEST_NAME'] = (
-                    'test_' +
-                    connection.settings_dict['NAME'] +
-                    '__' + str(self.which_process)
+
+            for connection in connections.all():
+                test_alias = 'test_{name}__{process}'.format(
+                    name=connection.settings_dict['NAME'],
+                    process=self.which_process,
                 )
+
+                if django.VERSION >= (1, 7):
+                    connection.settings_dict.setdefault('TEST', {})
+                    connection.settings_dict['TEST']['NAME'] = test_alias
+                else:
+                    connection.settings_dict['TEST_NAME'] = test_alias
 
         super(NosePicker, self).configure(options, config)
 
