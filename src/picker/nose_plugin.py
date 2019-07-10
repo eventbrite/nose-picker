@@ -46,9 +46,9 @@ def hash_filename(filename):
     of the current working directory, and then removes the
     current working directory from the path.
     '''
-    here = os.path.abspath(os.getcwd())
-    there = os.path.abspath(filename)
-    assert there.startswith(here)
+    here = os.path.realpath(os.getcwd())
+    there = os.path.realpath(filename)
+    assert there.startswith(here), "{} must start with {}".format(there, here)
 
     shorter_there = there[len(here):]
     as_int = int(hashlib.sha1(shorter_there).hexdigest(), 16)
