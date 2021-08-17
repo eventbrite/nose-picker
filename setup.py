@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+from __future__ import print_function
 import os
 import sys
 
@@ -11,9 +13,9 @@ VERSION = '0.5.5'
 
 if sys.argv[-1] == 'publish':
     os.system('python setup.py sdist bdist_wheel upload')
-    print "You should also consider tagging a release:"
-    print "  git tag -a %s -m 'version %s'" % (VERSION, VERSION)
-    print "  git push --tags"
+    print("You should also consider tagging a release:")
+    print("  git tag -a %s -m 'version %s'" % (VERSION, VERSION))
+    print("  git push --tags")
     sys.exit()
 
 
@@ -29,6 +31,7 @@ setup(
     long_description=README,
     url='https://github.com/eventbrite/nose-picker',
     license='BSD',
+    install_requires=['six >=1.16'],
     packages=find_packages('src'),
     package_dir={'': 'src'},
     include_package_data=True,
