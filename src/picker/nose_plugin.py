@@ -28,6 +28,8 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from __future__ import absolute_import
+import six
 import hashlib
 import logging
 import os
@@ -50,7 +52,7 @@ def hash_filename(filename):
     there = os.path.realpath(filename)
     assert there.startswith(here), "{} must start with {}".format(there, here)
 
-    shorter_there = there[len(here):]
+    shorter_there = six.ensure_binary(there[len(here):])
     as_int = int(hashlib.sha1(shorter_there).hexdigest(), 16)
     return as_int
 

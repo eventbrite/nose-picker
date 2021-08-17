@@ -29,10 +29,12 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
+from __future__ import absolute_import
 import multiprocessing
 import subprocess
 import sys
 import threading
+from six.moves import range
 
 
 def main():
