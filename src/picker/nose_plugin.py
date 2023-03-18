@@ -33,6 +33,7 @@ import six
 import hashlib
 import logging
 import os
+import site
 
 from nose.plugins import Plugin
 
@@ -44,13 +45,19 @@ def hash_filename(filename):
     * Return the same number even if the filename
       is now in a different path.
 
-    To achieve that, it assumes that filename is a sub-path
-    of the current working directory, and then removes the
-    current working directory from the path.
+    To achieve that, it assumes that filename is a sub-path of the current working directory or site packages,
+    and then removes the current working directory from the path.
     '''
     here = os.path.realpath(os.getcwd())
     there = os.path.realpath(filename)
-    assert there.startswith(here), "{} must start with {}".format(there, here)
+    if not there.startswith(here):
+        for path in site.getsitepackages():
+            if there.startswith(path):
+                here = path
+    assert there.startswith(here), "{} must start with {} or be in site packages".format(
+        there,
+        os.path.realpath(os.getcwd()),
+    )
 
     shorter_there = six.ensure_binary(there[len(here):])
     as_int = int(hashlib.sha1(shorter_there).hexdigest(), 16)
