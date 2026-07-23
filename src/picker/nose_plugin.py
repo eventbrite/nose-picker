@@ -245,8 +245,30 @@ def _bin_pack_files(candidate_keys, durations, total_processes, logger, stale_th
     file can never be split across bins, so no bin-packing scheme built on
     top of nose's per-file wantFile() hook can fully even out wall-clock time
     if one file dominates -- see the PR description / README for this ceiling.
+
+    Returns (bin_files, bin_totals), or (None, None) if there is no usable
+    timing signal at all for `candidate_keys` (durations table doesn't cover
+    any of them, or every covered value is <= 0) -- see the guard below for
+    why that specific case can't be bin-packed.
     '''
     known_values = [durations[k] for k in candidate_keys if k in durations]
+
+    if not known_values or max(known_values) <= 0.0:
+        # No usable timing signal at all for this candidate set -- every file
+        # would get weight 0.0 (median of nothing, or median of all-zeros),
+        # which collapses the whole LPT loop onto bin 0: adding 0.0 never
+        # changes bin_totals, so bin_totals.index(min(bin_totals)) never
+        # advances past index 0 and the entire suite lands on one shard,
+        # actively worse than the hash-modulo behavior this is meant to
+        # improve on. Signal "can't bin-pack" to the caller so it falls back
+        # to classic hash-based selection instead.
+        logger.warning(
+            'nose-picker: no usable durations found among %d discovered test '
+            'files; falling back to hash-based file selection.',
+            len(candidate_keys),
+        )
+        return None, None
+
     fallback_weight = _median(known_values)
     missing = [k for k in candidate_keys if k not in durations]
 
@@ -264,10 +286,23 @@ def _bin_pack_files(candidate_keys, durations, total_processes, logger, stale_th
     ordered = sorted(candidate_keys, key=lambda key: (-weights[key], key))
 
     bin_totals = [0.0] * total_processes
+    bin_counts = [0] * total_processes
     bin_files = [[] for _ in range(total_processes)]
     for key in ordered:
-        target = bin_totals.index(min(bin_totals))
+        # Break ties on bin total by which bin currently holds the fewest files, not by raw bin
+        # index. A plain `bin_totals.index(min(bin_totals))` looks safe but silently clumps any
+        # run of *equal-weight* files onto a single bin whenever the increment doesn't strictly
+        # grow past the tied group -- which is exactly what happens for weight 0.0 (adding 0.0
+        # never changes a bin's total, so it stays tied-for-minimum forever, and `.index(...)`
+        # always returns the same one). This isn't just the all-zero/no-signal case guarded above:
+        # a perfectly healthy table can still legitimately have a handful of individual files at
+        # exactly 0.0 (e.g. trivial/empty test files) mixed in with real positive durations, and
+        # those would clump the same way without this. Tracking file counts per bin and using them
+        # as the tie-break makes any tied group -- all-zero, partially-zero, or equal-nonzero --
+        # round-robin across bins instead.
+        target = min(range(total_processes), key=lambda i: (bin_totals[i], bin_counts[i]))
         bin_totals[target] += weights[key]
+        bin_counts[target] += 1
         bin_files[target].append(key)
 
     return bin_files, bin_totals
@@ -381,6 +416,11 @@ class NosePicker(Plugin):
         bins, totals = _bin_pack_files(
             candidate_keys, durations, self.total_processes, self.logger,
         )
+        if bins is None:
+            # No usable timing signal at all (see _bin_pack_files) -- it already
+            # logged why. self._assigned_files is still None from configure(),
+            # so _should_run() falls back to hash-based selection for this run.
+            return
         self._assigned_files = frozenset(bins[self.which_process])
         self._all_candidate_keys = frozenset(candidate_keys)
         self.logger.info(

@@ -118,11 +118,58 @@ class BinPackFilesTest(unittest.TestCase):
         self.assertEqual(sorted(assigned), sorted(keys))
 
     def test_deterministic_tie_break_by_path(self):
-        durations = {}
+        # One known value so every file (including the two unknowns, which fall back to the
+        # median of known values) ties at the same weight -- exercises path tie-breaking without
+        # tripping the all-unknown collapse guard covered separately below.
+        durations = {'/z.py': 5.0}
         keys = ['/z.py', '/a.py', '/m.py']
         bins1, _ = _bin_pack_files(keys, durations, 3, self.logger)
         bins2, _ = _bin_pack_files(list(reversed(keys)), durations, 3, self.logger)
         self.assertEqual(bins1, bins2)
+
+    def test_no_usable_durations_signals_fallback_instead_of_collapsing(self):
+        # Regression test: previously, when no candidate file had a known duration (or all known
+        # durations were <= 0), every file got weight 0.0, and the LPT loop's
+        # `bin_totals.index(min(bin_totals))` never advanced past index 0 (adding 0.0 never
+        # changes bin_totals) -- the entire suite silently collapsed onto a single shard, with
+        # every other shard getting nothing. _bin_pack_files must now signal "can't bin-pack" by
+        # returning (None, None) instead, so the caller falls back to hash-based selection.
+        keys = ['/a.py', '/b.py', '/c.py']
+
+        bins, totals = _bin_pack_files(keys, {}, 3, self.logger)
+        self.assertIsNone(bins)
+        self.assertIsNone(totals)
+
+        all_zero_durations = dict((key, 0.0) for key in keys)
+        bins, totals = _bin_pack_files(keys, all_zero_durations, 3, self.logger)
+        self.assertIsNone(bins)
+        self.assertIsNone(totals)
+
+    def test_partial_zero_weight_files_round_robin_instead_of_clumping(self):
+        # Narrower, separate regression case from the total-collapse one above: a perfectly
+        # healthy table (real positive durations exist, so the bail-out guard doesn't fire) can
+        # still legitimately have a handful of individual files measured at exactly 0.0 (trivial
+        # or empty test files). LPT sorts heaviest-first, so all the 0.0-weight files end up
+        # adjacent at the tail of `ordered`; a naive `bin_totals.index(min(bin_totals))` tie-break
+        # would clump every one of them onto whichever single bin happened to be minimum when the
+        # zero-weight run started, since adding 0.0 never changes that bin's total. They must
+        # instead round-robin, by file count, across whichever bins are currently tied-minimum.
+        zero_weight_files = ['/zero_%d.py' % i for i in range(6)]
+        durations = dict((f, 0.0) for f in zero_weight_files)
+        durations['/big.py'] = 100.0
+        keys = ['/big.py'] + zero_weight_files
+        bins, totals = _bin_pack_files(keys, durations, 3, self.logger)
+
+        self.assertEqual(sorted(sum(bins, [])), sorted(keys))
+        zero_weight_bin_sizes = sorted(
+            sum(1 for f in b if f in zero_weight_files) for b in bins
+        )
+        # /big.py's bin is left at total=100 after the first placement, so it's correctly never
+        # tied-minimum again -- the 6 zero-weight files round-robin evenly across the *other* two
+        # bins only (3/3), rather than all 6 clumping onto whichever single bin the old
+        # `bin_totals.index(min(...))` tie-break happened to pick first (the bug this regression
+        # test covers would have produced something like [0, 0, 6] here).
+        self.assertEqual(zero_weight_bin_sizes, [0, 3, 3])
 
 
 class HashFilenameBackwardCompatTest(unittest.TestCase):
@@ -244,6 +291,28 @@ class FullShardCoverageTest(unittest.TestCase):
             json.dump({self.expected_keys[0]: 42.0}, fh)
         assignment = self._run_all_shards(3, file_durations=path)
         self._assert_bijection(assignment)
+
+    def test_duration_mode_wholly_unmatched_table_falls_back_identically_to_legacy(self):
+        # Regression coverage for the all-unknown-durations collapse bug: a durations table that
+        # doesn't overlap the discovered candidate set at all (e.g. every path in it belongs to
+        # files that no longer exist) must fall back to hash-based selection -- not silently
+        # collapse the whole suite onto shard 0.
+        path = os.path.join(self.tmp, 'wholly_unmatched.json')
+        with open(path, 'w') as fh:
+            json.dump({'/this/file/does/not/exist.py': 123.0}, fh)
+        legacy = self._run_all_shards(3, file_durations=None)
+        fallback = self._run_all_shards(3, file_durations=path)
+        self._assert_bijection(fallback)
+        self.assertEqual(legacy, fallback)
+
+    def test_duration_mode_all_zero_durations_falls_back_identically_to_legacy(self):
+        path = os.path.join(self.tmp, 'all_zero.json')
+        with open(path, 'w') as fh:
+            json.dump(dict((k, 0.0) for k in self.expected_keys), fh)
+        legacy = self._run_all_shards(3, file_durations=None)
+        fallback = self._run_all_shards(3, file_durations=path)
+        self._assert_bijection(fallback)
+        self.assertEqual(legacy, fallback)
 
     def test_missing_durations_file_falls_back_identically_to_legacy(self):
         legacy = self._run_all_shards(3, file_durations=None)
