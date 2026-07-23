@@ -157,10 +157,29 @@ def _load_durations_file(path, logger):
     durations = {}
     for key, value in raw.items():
         try:
-            durations[key] = float(value)
+            parsed = float(value)
         except (TypeError, ValueError):
             continue
+        if not _is_finite(parsed):
+            # Python's json module accepts bare NaN/Infinity/-Infinity literals by default (a
+            # non-standard extension), so a corrupt or hand-edited durations file can produce one
+            # of these here even though float(value) "succeeded". A NaN weight breaks every
+            # comparison downstream (NaN is never <, >, or == anything, including itself) --
+            # _bin_pack_files' own bail-out guard and its LPT tie-break both rely on ordinary
+            # float comparisons behaving normally, so silently admitting a NaN/Infinity here would
+            # reintroduce a single-shard collapse through the back door. Treat it exactly like any
+            # other value that failed to parse: drop the entry, fall back to the median for that
+            # key at bin-packing time.
+            continue
+        durations[key] = parsed
     return durations
+
+
+def _is_finite(value):
+    '''No math.isfinite on Python 2.7 (added in Python 3.2). NaN is the only float that doesn't
+    equal itself; +-inf are the only floats equal to float('inf')/float('-inf').
+    '''
+    return value == value and value not in (float('inf'), float('-inf'))
 
 
 def _bin_pack_files(candidate_keys, durations, total_processes, logger, stale_threshold=0.30):
@@ -187,6 +206,18 @@ def _bin_pack_files(candidate_keys, durations, total_processes, logger, stale_th
     any of them, or every covered value is <= 0) -- see the guard below for
     why that specific case can't be bin-packed.
     '''
+    # Defensively re-sanitize here too, even though _load_durations_file() already filters
+    # non-finite values on the normal production path: this function is independently
+    # unit-tested and could be called with a hand-built `durations` dict from anywhere. A NaN
+    # weight is uniquely dangerous because NaN is never <, >, or == anything (including itself),
+    # which breaks both the bail-out guard below (`max()` over a list containing NaN is
+    # order-dependent and can silently return NaN, making `NaN <= 0.0` evaluate False) and the
+    # LPT tie-break's bin_totals comparisons (a bin total poisoned by NaN can never again compare
+    # as strictly less than another bin, effectively freezing every remaining candidate onto a
+    # single bin) -- treating a non-finite entry as though the key were simply absent from
+    # `durations` (falls back to the median, like any other missing/unparseable value) closes
+    # both of those off at the source instead of trying to special-case NaN/Infinity downstream.
+    durations = dict((k, v) for k, v in durations.items() if _is_finite(v))
     known_values = [durations[k] for k in candidate_keys if k in durations]
 
     if not known_values or max(known_values) <= 0.0:

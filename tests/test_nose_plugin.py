@@ -109,6 +109,22 @@ class LoadDurationsFileTest(unittest.TestCase):
         finally:
             os.unlink(fh.name)
 
+    def test_nan_and_infinity_values_are_dropped(self):
+        # Regression test: Python's json module accepts bare NaN/Infinity/-Infinity literals by
+        # default (a non-standard extension) -- a corrupt or hand-edited durations file can
+        # produce these even though float(value) "succeeds". A NaN weight breaks every comparison
+        # downstream (NaN is never <, >, or == anything, including itself), which can silently
+        # collapse the whole LPT bin-packing loop onto a single shard. These must be dropped at
+        # ingestion, same as any other value that fails to parse as a float.
+        fh = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+        fh.write(b'{"/nan.py": NaN, "/inf.py": Infinity, "/neg_inf.py": -Infinity, "/ok.py": 5.0}')
+        fh.close()
+        try:
+            durations = _load_durations_file(fh.name, self.logger)
+            self.assertEqual(durations, {'/ok.py': 5.0})
+        finally:
+            os.unlink(fh.name)
+
 
 class BinPackFilesTest(unittest.TestCase):
     def setUp(self):
@@ -182,6 +198,31 @@ class BinPackFilesTest(unittest.TestCase):
         # `bin_totals.index(min(...))` tie-break happened to pick first (the bug this regression
         # test covers would have produced something like [0, 0, 6] here).
         self.assertEqual(zero_weight_bin_sizes, [0, 3, 3])
+
+    def test_nan_weight_does_not_collapse_bins(self):
+        # Regression test: _bin_pack_files defensively re-sanitizes its own `durations` input
+        # (not just relying on _load_durations_file() having already done so), since a NaN value
+        # anywhere in it breaks ordinary float comparisons (NaN is never <, >, or == anything,
+        # including itself) badly enough to silently collapse the whole LPT loop onto one shard.
+        # A NaN entry must be treated exactly like a missing one -- falls back to the median.
+        durations = {
+            '/a.py': 10.0, '/b.py': 20.0, '/c.py': 30.0,
+            '/nan.py': float('nan'),
+        }
+        keys = list(durations.keys())
+        bins, totals = _bin_pack_files(keys, durations, 3, self.logger)
+        self.assertIsNotNone(bins)
+        self.assertEqual(sorted(sum(bins, [])), sorted(keys))
+        # every bin actually got at least one file -- the collapse bug this guards against would
+        # have dumped everything onto a single bin instead.
+        self.assertTrue(all(b for b in bins), bins)
+
+    def test_all_nan_durations_signals_fallback(self):
+        keys = ['/a.py', '/b.py']
+        durations = dict((k, float('nan')) for k in keys)
+        bins, totals = _bin_pack_files(keys, durations, 2, self.logger)
+        self.assertIsNone(bins)
+        self.assertIsNone(totals)
 
 
 class HashFilenameBackwardCompatTest(unittest.TestCase):
