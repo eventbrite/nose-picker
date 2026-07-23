@@ -223,6 +223,91 @@ class DiscoverCandidateFilesTest(unittest.TestCase):
         ]))
 
 
+class NestedNonPackageDirectoryTest(unittest.TestCase):
+    """Regression coverage for a matching-semantics question raised (and empirically settled)
+    during review: does nose 1.3.7 apply testMatch against a directory's basename only, or
+    against the full path (which would let an already-matching ancestor segment like `tests/`
+    "cover" a non-matching, non-package child like `tests/unit/`)?
+
+    Verified directly against real nose 1.3.7 (not just by reading its source): a
+    `tests/unit/test_foo.py` layout where `unit` has no `__init__.py` and doesn't itself contain
+    "test" produces **zero** collected tests under plain `nosetests -v` -- nose's own
+    `Selector.wantDirectory` only ever inspects `os.path.basename(dirname)`
+    (`tail = op_basename(dirname); ... self.matches(tail)`), so a matching ancestor does *not*
+    rescue a non-matching, non-package child directory. This module's `_wants_directory` mirrors
+    that (basename-only) on purpose -- switching it to check the full path, as the regex's
+    inclusion of `os.sep` might suggest at a glance, would make discovery *more* permissive than
+    real nose and start bin-packing files nose itself would never actually collect.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _make(self, rel_parts):
+        full = os.path.join(self.tmp, *rel_parts)
+        d = os.path.dirname(full)
+        if not os.path.isdir(d):
+            os.makedirs(d)
+        open(full, 'w').close()
+
+    def test_non_package_child_of_a_matching_dir_is_not_discovered(self):
+        # `tests` matches testMatch on its own basename; `unit` does not, and isn't a package.
+        self._make(['tests/unit/test_should_not_appear.py'])
+        candidates = discover_candidate_files(self.tmp)
+        self.assertEqual(candidates, [])
+
+    def test_package_child_of_a_matching_dir_is_discovered(self):
+        # Same layout, but `unit` (and `tests`) are now proper packages -- ispackage() alone is
+        # enough to recurse regardless of the directory's own name, in both real nose and here.
+        self._make(['tests/__init__.py'])
+        self._make(['tests/unit/__init__.py'])
+        self._make(['tests/unit/test_should_appear.py'])
+        candidates = discover_candidate_files(self.tmp)
+        rels = sorted(_relative_key(c, cwd=self.tmp) for c in candidates)
+        self.assertEqual(rels, ['/tests/unit/test_should_appear.py'])
+
+
+class SymlinkDedupTest(unittest.TestCase):
+    """Regression coverage: a symlink to a test file must not produce a second candidate for
+    what's really the same physical file. discover_candidate_files() dedupes by
+    os.path.realpath() at file granularity (mirroring the same realpath-based identity
+    hash_filename()/_relative_key() already use, and the same dedup discover_candidate_files()
+    already did for directories to guard against symlink cycles) -- without it, _bin_pack_files
+    could place the real file and its symlink into two different bins, and two shards would each
+    believe they own the file and both run it, unlike legacy hash mode (realpath-based, so a
+    symlink and its target always hash identically and land on one shard together).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_symlinked_file_does_not_duplicate_candidate(self):
+        real_path = os.path.join(self.tmp, 'test_real.py')
+        open(real_path, 'w').close()
+        symlink_path = os.path.join(self.tmp, 'test_symlink.py')
+        os.symlink(real_path, symlink_path)
+
+        candidates = discover_candidate_files(self.tmp)
+        # Two directory entries exist (test_real.py, test_symlink.py), but they're the same
+        # underlying file -- exactly one candidate, not two.
+        self.assertEqual(len(candidates), 1)
+
+    def test_symlinked_directory_does_not_duplicate_candidates(self):
+        real_dir = os.path.join(self.tmp, 'real_tests')
+        os.makedirs(real_dir)
+        open(os.path.join(real_dir, 'test_a.py'), 'w').close()
+        os.symlink(real_dir, os.path.join(self.tmp, 'test_symlinked_dir'))
+
+        candidates = discover_candidate_files(self.tmp)
+        self.assertEqual(len(candidates), 1)
+
+
 class FullShardCoverageTest(unittest.TestCase):
     """End-to-end style checks: across every shard 0..N-1, every discovered
     file must be claimed by exactly one shard -- in legacy hash mode, in

@@ -146,10 +146,18 @@ def discover_candidate_files(root):
     complete candidate set that --which-process/--total-processes selection
     has always operated over one file at a time, without ever seeing the
     full list.
+
+    Dedupes by os.path.realpath() at both directory and file granularity, so
+    a symlink (a symlinked directory anywhere on the path, or a direct
+    symlink to a file) can never produce two separate entries for what's
+    really the same underlying file -- exactly the same realpath-based
+    identity hash_filename()/_relative_key() already use elsewhere in this
+    module, applied here too so callers never see duplicate candidates.
     '''
     root = os.path.realpath(root)
     candidates = []
     visited_dirs = set()
+    visited_files = set()
 
     def _walk(path):
         real = os.path.realpath(path)
@@ -166,6 +174,10 @@ def discover_candidate_files(root):
             entry_path = os.path.join(path, entry)
             if os.path.isfile(entry_path):
                 if _wants_file(entry, entry_path):
+                    real_file = os.path.realpath(entry_path)
+                    if real_file in visited_files:
+                        continue
+                    visited_files.add(real_file)
                     candidates.append(entry_path)
             elif os.path.isdir(entry_path):
                 if entry.startswith('_'):
@@ -402,6 +414,16 @@ class NosePicker(Plugin):
         if durations is None:
             return
 
+        # discover_candidate_files() already dedupes by os.path.realpath() at both directory and
+        # file granularity (see its docstring), so a symlink and its target can never appear as
+        # two separate entries here -- each candidate_keys entry (itself realpath-derived, via
+        # _relative_key()) is guaranteed unique. That invariant matters: without it,
+        # _bin_pack_files could place two occurrences of what's really one physical file into
+        # different bins, and two shards would each believe they own it and both run it. Legacy
+        # hash mode never had this failure mode (hash_filename() is realpath-based too, so a
+        # symlink and its target always hash identically and land on one shard together) --
+        # duration mode needs to preserve that same guarantee itself, which is what
+        # discover_candidate_files()'s dedup is for.
         candidate_paths = discover_candidate_files(os.getcwd())
         candidate_keys = [_relative_key(path) for path in candidate_paths]
 
