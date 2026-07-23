@@ -15,6 +15,57 @@ running through, does a modulo division by N, then sees if this file is "its".
 Very simple, but it lets you run multiple of these **nose-picker** enabled
 runners in parallel, each running a separate subset of the unit tests!
 
+Optional: duration-aware bin-packing (``--file-durations``)
+-------------------------------------------------------------
+
+By default (and if you do nothing differently), **nose-picker** still just
+hashes each candidate file's path and mods it by ``--total-processes`` --
+completely unchanged from prior releases. If your files vary a lot in how
+long they take to run, hashing can produce very unbalanced shards even
+though each shard gets roughly the same *number* of files.
+
+As of 0.6.0, you can opt in to duration-aware bin-packing instead::
+
+    --file-durations=/path/to/durations.json
+
+where ``durations.json`` looks like::
+
+    {
+        "/ebapps/foo/tests/test_bar.py": 12.34,
+        "/common/tests/test_baz.py": 0.87
+    }
+
+(keys are relative paths using the same "strip the cwd/site-packages prefix"
+convention ``hash_filename()`` has always used).
+
+When given a valid file, nose-picker walks the current working directory
+once, up front (during nose's plugin ``configure()`` step, before test
+collection starts), building the same file candidate list nose's own default
+discovery convention would produce, and greedily bin-packs those files across
+``--total-processes`` bins by descending duration (longest processing time
+first), so each shard ends up with roughly the same *total* runtime instead
+of roughly the same file count. Files with no entry in the durations table
+are weighted with the median of all known durations, and a warning is logged
+(via the ``nose.plugins.picker`` logger) if too large a fraction of the
+discovered files are missing from the table, since that's a sign the table
+has gone stale.
+
+**Backward compatibility guarantee**: if ``--file-durations`` is not passed,
+or the given path doesn't exist, can't be read, or doesn't parse as JSON,
+behavior is *exactly* the classic hash-modulo selection, unchanged. This is
+deliberate and load-bearing: nose-picker has other consumers besides the one
+that motivated this feature, and none of them should see any behavior change
+unless they explicitly pass the new flag.
+
+**Known ceiling**: bin-packing here only ever operates at whole-file
+granularity, because nose only ever asks this plugin "do you want this
+file?" one file at a time -- there's no hook to split a single file's tests
+across shards. If one test file alone takes far longer to run than an even
+share of the total suite, no bin-packing scheme built on this hook can even
+out wall-clock time; that file's own duration becomes a floor for whatever
+shard it lands in. Bin-packing helps a lot when slowness is spread across
+many files, much less when it's concentrated in one.
+
 Motivation
 ----------
 

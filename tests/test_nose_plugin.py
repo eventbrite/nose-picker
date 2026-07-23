@@ -1,0 +1,263 @@
+from __future__ import absolute_import
+
+import json
+import logging
+import os
+import random
+import shutil
+import tempfile
+import unittest
+
+from picker.nose_plugin import (
+    NosePicker,
+    _bin_pack_files,
+    _load_durations_file,
+    _median,
+    _relative_key,
+    discover_candidate_files,
+    hash_filename,
+)
+
+
+class _FakeOptions(object):
+    """Minimal stand-in for optparse.Values, good enough to drive
+    NosePicker.configure() the way nose's own OptionParser would.
+    """
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+    def __getattr__(self, item):
+        return None
+
+
+class _FakeConfig(object):
+    pass
+
+
+def _make_options(which_process, total_processes, file_durations=None):
+    return _FakeOptions(**{
+        'with-nose-picker': True,  # NosePicker.enableOpt is 'with-nose-picker', dash not underscore
+        'which_process': which_process,
+        'total_processes': total_processes,
+        'futz_with_django': False,
+        'file_durations': file_durations,
+    })
+
+
+class MedianTest(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(_median([]), 0.0)
+
+    def test_single(self):
+        self.assertEqual(_median([5]), 5.0)
+
+    def test_odd(self):
+        self.assertEqual(_median([3, 1, 2]), 2.0)
+
+    def test_even(self):
+        self.assertEqual(_median([4, 1, 3, 2]), 2.5)
+
+
+class LoadDurationsFileTest(unittest.TestCase):
+    def setUp(self):
+        self.logger = logging.getLogger('test.nose_picker')
+
+    def test_none_path(self):
+        self.assertIsNone(_load_durations_file(None, self.logger))
+
+    def test_missing_path(self):
+        self.assertIsNone(_load_durations_file('/no/such/file.json', self.logger))
+
+    def test_invalid_json(self):
+        fh = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+        fh.write(b'{not valid json')
+        fh.close()
+        try:
+            self.assertIsNone(_load_durations_file(fh.name, self.logger))
+        finally:
+            os.unlink(fh.name)
+
+    def test_non_object_json(self):
+        fh = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+        fh.write(b'[1, 2, 3]')
+        fh.close()
+        try:
+            self.assertIsNone(_load_durations_file(fh.name, self.logger))
+        finally:
+            os.unlink(fh.name)
+
+    def test_valid_json(self):
+        fh = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+        fh.write(json.dumps({'/a/test_foo.py': 12.5}).encode('utf-8'))
+        fh.close()
+        try:
+            durations = _load_durations_file(fh.name, self.logger)
+            self.assertEqual(durations, {'/a/test_foo.py': 12.5})
+        finally:
+            os.unlink(fh.name)
+
+
+class BinPackFilesTest(unittest.TestCase):
+    def setUp(self):
+        self.logger = logging.getLogger('test.nose_picker')
+
+    def test_balances_known_weights(self):
+        durations = {'/a.py': 10.0, '/b.py': 1.0, '/c.py': 1.0, '/d.py': 1.0}
+        keys = list(durations.keys())
+        bins, totals = _bin_pack_files(keys, durations, 2, self.logger)
+        # the one big file should be alone in a bin, balanced against the 3 small ones
+        self.assertEqual(sorted(sum(bins, [])), sorted(keys))
+        self.assertAlmostEqual(max(totals) - min(totals), 7.0)
+
+    def test_unknown_files_get_median_weight(self):
+        durations = {'/a.py': 10.0, '/b.py': 20.0}
+        keys = ['/a.py', '/b.py', '/unknown.py']
+        bins, totals = _bin_pack_files(keys, durations, 3, self.logger)
+        assigned = sum(bins, [])
+        self.assertEqual(sorted(assigned), sorted(keys))
+
+    def test_deterministic_tie_break_by_path(self):
+        durations = {}
+        keys = ['/z.py', '/a.py', '/m.py']
+        bins1, _ = _bin_pack_files(keys, durations, 3, self.logger)
+        bins2, _ = _bin_pack_files(list(reversed(keys)), durations, 3, self.logger)
+        self.assertEqual(bins1, bins2)
+
+
+class HashFilenameBackwardCompatTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_cwd = os.getcwd()
+        os.chdir(self.tmp)
+
+    def tearDown(self):
+        os.chdir(self.old_cwd)
+        shutil.rmtree(self.tmp)
+
+    def test_stable_across_relative_and_absolute(self):
+        path = os.path.join(self.tmp, 'test_foo.py')
+        open(path, 'w').close()
+        self.assertEqual(hash_filename(path), hash_filename('test_foo.py'))
+
+
+class DiscoverCandidateFilesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._make(['pkg/__init__.py'])
+        self._make(['pkg/test_foo.py'])
+        self._make(['pkg/bar_test.py'])
+        self._make(['pkg/helpers.py'])  # not test-like, must be excluded
+        self._make(['pkg/sub/__init__.py'])
+        self._make(['pkg/sub/test_deep.py'])
+        self._make(['lib/test_in_lib.py'])  # nose's srcDirs special case
+        self._make(['notpkg/test_should_not_appear.py'])  # non-package, non-testMatch dir
+        self._make(['_hidden/test_should_not_appear2.py'])  # leading underscore dir
+        self._make(['.dotdir/test_should_not_appear3.py'])  # leading dot dir
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def _make(self, rel_parts):
+        full = os.path.join(self.tmp, *rel_parts)
+        d = os.path.dirname(full)
+        if not os.path.isdir(d):
+            os.makedirs(d)
+        open(full, 'w').close()
+
+    def test_matches_nose_default_conventions(self):
+        candidates = discover_candidate_files(self.tmp)
+        rels = sorted(_relative_key(c, cwd=self.tmp) for c in candidates)
+        self.assertEqual(rels, sorted([
+            '/lib/test_in_lib.py',
+            '/pkg/bar_test.py',
+            '/pkg/sub/test_deep.py',
+            '/pkg/test_foo.py',
+        ]))
+
+
+class FullShardCoverageTest(unittest.TestCase):
+    """End-to-end style checks: across every shard 0..N-1, every discovered
+    file must be claimed by exactly one shard -- in legacy hash mode, in
+    duration mode, and in every fallback path duration mode can take.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_cwd = os.getcwd()
+        for rel in [
+            'pkg/__init__.py', 'pkg/test_foo.py', 'pkg/bar_test.py',
+            'pkg/helpers.py', 'pkg/sub/__init__.py', 'pkg/sub/test_deep.py',
+            'lib/test_in_lib.py',
+        ]:
+            full = os.path.join(self.tmp, rel)
+            d = os.path.dirname(full)
+            if not os.path.isdir(d):
+                os.makedirs(d)
+            open(full, 'w').close()
+        os.chdir(self.tmp)
+        self.expected_keys = sorted(
+            _relative_key(c, cwd=self.tmp)
+            for c in discover_candidate_files(self.tmp)
+        )
+        self.assertEqual(len(self.expected_keys), 4)
+
+    def tearDown(self):
+        os.chdir(self.old_cwd)
+        shutil.rmtree(self.tmp)
+
+    def _run_all_shards(self, total_processes, file_durations=None):
+        assignment = {}
+        for which in range(total_processes):
+            plugin = NosePicker()
+            plugin.configure(
+                _make_options(which, total_processes, file_durations),
+                _FakeConfig(),
+            )
+            for full_path in discover_candidate_files(self.tmp):
+                key = _relative_key(full_path, cwd=self.tmp)
+                wanted = plugin._should_run(full_path) is None
+                if wanted:
+                    assignment.setdefault(key, []).append(which)
+        return assignment
+
+    def _assert_bijection(self, assignment):
+        self.assertEqual(sorted(assignment.keys()), self.expected_keys)
+        for key, shards in assignment.items():
+            self.assertEqual(len(shards), 1, 'file %s claimed by %r' % (key, shards))
+
+    def test_legacy_hash_mode(self):
+        assignment = self._run_all_shards(3, file_durations=None)
+        self._assert_bijection(assignment)
+
+    def test_duration_mode_fully_known(self):
+        durations = dict((k, random.uniform(1, 100)) for k in self.expected_keys)
+        path = os.path.join(self.tmp, 'durations.json')
+        with open(path, 'w') as fh:
+            json.dump(durations, fh)
+        assignment = self._run_all_shards(3, file_durations=path)
+        self._assert_bijection(assignment)
+
+    def test_duration_mode_stale_table_still_covers_everything(self):
+        path = os.path.join(self.tmp, 'partial.json')
+        with open(path, 'w') as fh:
+            json.dump({self.expected_keys[0]: 42.0}, fh)
+        assignment = self._run_all_shards(3, file_durations=path)
+        self._assert_bijection(assignment)
+
+    def test_missing_durations_file_falls_back_identically_to_legacy(self):
+        legacy = self._run_all_shards(3, file_durations=None)
+        fallback = self._run_all_shards(3, file_durations='/no/such/file.json')
+        self.assertEqual(legacy, fallback)
+
+    def test_invalid_json_falls_back_identically_to_legacy(self):
+        path = os.path.join(self.tmp, 'bad.json')
+        with open(path, 'w') as fh:
+            fh.write('{not valid json')
+        legacy = self._run_all_shards(3, file_durations=None)
+        fallback = self._run_all_shards(3, file_durations=path)
+        self.assertEqual(legacy, fallback)
+
+
+if __name__ == '__main__':
+    unittest.main()
