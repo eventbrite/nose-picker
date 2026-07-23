@@ -34,6 +34,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import site
 
 from nose.plugins import Plugin
@@ -160,16 +161,22 @@ def _load_durations_file(path, logger):
             parsed = float(value)
         except (TypeError, ValueError):
             continue
-        if not _is_finite(parsed):
+        if not _is_valid_duration(parsed):
             # Python's json module accepts bare NaN/Infinity/-Infinity literals by default (a
             # non-standard extension), so a corrupt or hand-edited durations file can produce one
             # of these here even though float(value) "succeeded". A NaN weight breaks every
             # comparison downstream (NaN is never <, >, or == anything, including itself) --
             # _bin_pack_files' own bail-out guard and its LPT tie-break both rely on ordinary
             # float comparisons behaving normally, so silently admitting a NaN/Infinity here would
-            # reintroduce a single-shard collapse through the back door. Treat it exactly like any
-            # other value that failed to parse: drop the entry, fall back to the median for that
-            # key at bin-packing time.
+            # reintroduce a single-shard collapse through the back door. A negative value is never
+            # physically meaningful for a measured runtime either (nothing stops a corrupt file or
+            # a buggy upstream aggregator from producing one), and is just as dangerous in a
+            # different way: it *lowers* whichever bin it's added to, so the LPT loop keeps
+            # preferring that artificially-cheap bin for every subsequent placement and piles most
+            # of the suite onto it -- an imbalance bug, not a collapse, but just as much a
+            # regression from hash-modulo. Treat all of these exactly like any other value that
+            # failed to parse: drop the entry, fall back to the median for that key at
+            # bin-packing time.
             continue
         durations[key] = parsed
     return durations
@@ -180,6 +187,15 @@ def _is_finite(value):
     equal itself; +-inf are the only floats equal to float('inf')/float('-inf').
     '''
     return value == value and value not in (float('inf'), float('-inf'))
+
+
+def _is_valid_duration(value):
+    '''A valid measured duration is finite and non-negative (see _is_finite for why non-finite
+    values are rejected; a negative value is never physically meaningful for a measured runtime,
+    and skews LPT bin-packing by artificially lowering whichever bin it lands in -- see callers).
+    Zero is valid (a trivial/empty test file can legitimately take ~0 seconds).
+    '''
+    return _is_finite(value) and value >= 0.0
 
 
 def _bin_pack_files(candidate_keys, durations, total_processes, logger, stale_threshold=0.30):
@@ -207,17 +223,19 @@ def _bin_pack_files(candidate_keys, durations, total_processes, logger, stale_th
     why that specific case can't be bin-packed.
     '''
     # Defensively re-sanitize here too, even though _load_durations_file() already filters
-    # non-finite values on the normal production path: this function is independently
-    # unit-tested and could be called with a hand-built `durations` dict from anywhere. A NaN
-    # weight is uniquely dangerous because NaN is never <, >, or == anything (including itself),
-    # which breaks both the bail-out guard below (`max()` over a list containing NaN is
-    # order-dependent and can silently return NaN, making `NaN <= 0.0` evaluate False) and the
-    # LPT tie-break's bin_totals comparisons (a bin total poisoned by NaN can never again compare
-    # as strictly less than another bin, effectively freezing every remaining candidate onto a
-    # single bin) -- treating a non-finite entry as though the key were simply absent from
-    # `durations` (falls back to the median, like any other missing/unparseable value) closes
-    # both of those off at the source instead of trying to special-case NaN/Infinity downstream.
-    durations = dict((k, v) for k, v in durations.items() if _is_finite(v))
+    # invalid values on the normal production path: this function is independently unit-tested
+    # and could be called with a hand-built `durations` dict from anywhere. A NaN weight is
+    # uniquely dangerous because NaN is never <, >, or == anything (including itself), which
+    # breaks both the bail-out guard below (`max()` over a list containing NaN is order-dependent
+    # and can silently return NaN, making `NaN <= 0.0` evaluate False) and the LPT tie-break's
+    # bin_totals comparisons (a bin total poisoned by NaN can never again compare as strictly less
+    # than another bin, effectively freezing every remaining candidate onto a single bin). A
+    # negative weight is dangerous in a different way -- it lowers whichever bin it's added to,
+    # so the LPT loop keeps preferring that artificially-cheap bin for every later placement,
+    # piling most of the suite onto it. Treating an invalid entry as though the key were simply
+    # absent from `durations` (falls back to the median, like any other missing/unparseable
+    # value) closes off both failure modes at the source instead of special-casing them downstream.
+    durations = dict((k, v) for k, v in durations.items() if _is_valid_duration(v))
     known_values = [durations[k] for k in candidate_keys if k in durations]
 
     if not known_values or max(known_values) <= 0.0:
@@ -273,6 +291,35 @@ def _bin_pack_files(candidate_keys, durations, total_processes, logger, stale_th
         bin_files[target].append(key)
 
     return bin_files, bin_totals
+
+
+# nose's own Selector.wantFile calls every registered plugin's wantFile() hook for *every*
+# non-ignored .py file it walks (ordinary source modules, __init__.py, helpers -- not just files
+# that look like tests), regardless of whether that file also matches nose's own testMatch
+# convention; testMatch only decides nose's *default* fallback answer when every plugin abstains
+# (returns None). NosePicker's own selection logic (_should_run below) already handles this
+# correctly by design -- returning None (not an explicit "yes") whenever hash/duration-membership
+# says "this shard wants it" defers to nose's own testMatch-based default for the final verdict,
+# exactly as the original 0.5.7 behavior always has, so no non-test file is ever incorrectly
+# selected as a result.
+#
+# But report()'s known-vs-unknown staleness counters (see NosePicker.report below) would still be
+# swamped by every one of those non-test wantFile() calls if they counted all of them equally --
+# in a large codebase, ordinary source files can easily outnumber real test files 10-100x, so the
+# "% of files unknown to the durations table" metric would be dominated by files that were never
+# going to be in that table anyway (it only ever contains real test-file keys, populated from
+# actual junit output), making the staleness warning fire constantly regardless of whether the
+# table is actually fresh. _looks_testlike is a best-effort, reporting-only heuristic (nose's own
+# default testMatch regex, used here purely to decide what's worth counting) to filter that noise
+# out. It is deliberately NOT used for any selection decision -- if it occasionally disagrees with
+# nose's real testMatch verdict, the only consequence is a slightly noisier or quieter staleness
+# warning, not a correctness bug, unlike the discovery-convention reimplementation this PR
+# removed (see the module docstring above the bin-packing section).
+_TESTLIKE_NAME_RE = re.compile(r'(?:^|[\b_\.%s-])[Tt]est' % os.sep)
+
+
+def _looks_testlike(basename):
+    return bool(_TESTLIKE_NAME_RE.search(basename))
 
 
 class NosePicker(Plugin):
@@ -417,8 +464,18 @@ class NosePicker(Plugin):
         if self.enabled:
             if self._assigned_files is not None:
                 key = _relative_key(name)
-                if key in self._known_keys:
-                    self._known_hits += 1
+                known = key in self._known_keys
+                # Only count staleness hits for files that at least look like tests by name --
+                # see _looks_testlike's comment for why (nose calls wantFile() for every .py file,
+                # not just test-like ones, and this metric would otherwise be swamped by ordinary
+                # source files that were never going to be in the durations table anyway). This
+                # never affects the actual selection logic below, only what report() counts.
+                if _looks_testlike(os.path.basename(name)):
+                    if known:
+                        self._known_hits += 1
+                    else:
+                        self._unknown_hits += 1
+                if known:
                     if key in self._assigned_files:
                         return None
                     return False
@@ -426,7 +483,6 @@ class NosePicker(Plugin):
                 # since the table was last refreshed, or the table doesn't cover it for any
                 # other reason). Fall back to the hash for this one file so it still runs in
                 # exactly one shard rather than vanishing from all of them.
-                self._unknown_hits += 1
                 return self._hash_should_run(name)
             return self._hash_should_run(name)
 

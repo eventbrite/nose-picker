@@ -12,6 +12,7 @@ from picker.nose_plugin import (
     NosePicker,
     _bin_pack_files,
     _load_durations_file,
+    _looks_testlike,
     _median,
     _relative_key,
     hash_filename,
@@ -55,6 +56,21 @@ class _ListHandler(logging.Handler):
 
     def emit(self, record):
         self.messages.append(record.getMessage())
+
+
+class LooksTestlikeTest(unittest.TestCase):
+    """_looks_testlike is a best-effort, reporting-only heuristic (see its module-level comment)
+    -- it must never be used for selection, only to keep report()'s staleness metric from being
+    swamped by the ordinary non-test .py files nose also calls wantFile() for.
+    """
+
+    def test_testlike_names(self):
+        for name in ('test_foo.py', 'foo_test.py', 'Test_Foo.py', 'tests.py'):
+            self.assertTrue(_looks_testlike(name), name)
+
+    def test_non_testlike_names(self):
+        for name in ('helpers.py', '__init__.py', 'utils.py', 'models.py', 'views.py', 'contest.py'):
+            self.assertFalse(_looks_testlike(name), name)
 
 
 class MedianTest(unittest.TestCase):
@@ -122,6 +138,23 @@ class LoadDurationsFileTest(unittest.TestCase):
         try:
             durations = _load_durations_file(fh.name, self.logger)
             self.assertEqual(durations, {'/ok.py': 5.0})
+        finally:
+            os.unlink(fh.name)
+
+    def test_negative_values_are_dropped(self):
+        # Regression test: a negative duration is never physically meaningful (nothing stops a
+        # corrupt file or a buggy upstream aggregator from producing one), and is dangerous in a
+        # different way than NaN/Infinity: it *lowers* whichever bin it's added to during
+        # bin-packing, so the LPT loop keeps preferring that artificially-cheap bin for every
+        # later placement and piles most of the suite onto it. Must be dropped at ingestion, same
+        # as NaN/Infinity and any other invalid value. Zero is fine (legitimately measured for a
+        # trivial/empty test file).
+        fh = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+        fh.write(json.dumps({'/negative.py': -5.0, '/zero.py': 0.0, '/ok.py': 5.0}).encode('utf-8'))
+        fh.close()
+        try:
+            durations = _load_durations_file(fh.name, self.logger)
+            self.assertEqual(durations, {'/zero.py': 0.0, '/ok.py': 5.0})
         finally:
             os.unlink(fh.name)
 
@@ -223,6 +256,26 @@ class BinPackFilesTest(unittest.TestCase):
         bins, totals = _bin_pack_files(keys, durations, 2, self.logger)
         self.assertIsNone(bins)
         self.assertIsNone(totals)
+
+    def test_negative_weight_does_not_skew_bins(self):
+        # Regression test: a negative duration artificially lowers whichever bin it's placed
+        # into, making the LPT loop keep preferring that bin for every later placement and piling
+        # most of the suite onto it -- unlike NaN, this doesn't collapse everything onto one bin
+        # via broken comparisons, it just badly imbalances the result. _bin_pack_files must treat
+        # a negative entry exactly like a missing one (falls back to the median), same defensive
+        # re-sanitization as the NaN case above.
+        durations = {
+            '/a.py': 10.0, '/b.py': 10.0, '/c.py': 10.0, '/d.py': 10.0,
+            '/negative.py': -1000.0,
+        }
+        keys = list(durations.keys())
+        bins, totals = _bin_pack_files(keys, durations, 2, self.logger)
+        self.assertIsNotNone(bins)
+        self.assertEqual(sorted(sum(bins, [])), sorted(keys))
+        # A poisoned negative weight would otherwise make one bin's total go deeply negative and
+        # never lose the "cheapest bin" comparison again, piling everything else onto it -- assert
+        # the two bins are still reasonably balanced instead.
+        self.assertLess(abs(totals[0] - totals[1]), 15.0)
 
 
 class HashFilenameBackwardCompatTest(unittest.TestCase):
@@ -419,6 +472,33 @@ class ReportStalenessWarningTest(unittest.TestCase):
         self.logger_handler.messages = []
         self.plugin.report(None)
         self.assertEqual(self.logger_handler.messages, [])
+
+    def test_non_testlike_files_do_not_inflate_staleness_metric(self):
+        # Regression test: nose's Selector.wantFile calls every plugin's wantFile() hook for
+        # *every* non-ignored .py file it walks, not just test-like ones (testMatch only decides
+        # nose's own default answer once every plugin has abstained). A flood of ordinary,
+        # non-test source files -- none in the durations table, since that table only ever
+        # contains real test-file keys -- must not count toward the unknown-hit staleness metric,
+        # or the warning would fire constantly regardless of whether the table is actually fresh.
+        durations_path = os.path.join(self.tmp, 'durations.json')
+        with open(durations_path, 'w') as fh:
+            json.dump({_relative_key(os.path.join(self.tmp, 'test_known.py'), cwd=self.tmp): 5.0}, fh)
+        self.plugin.configure(_make_options(0, 2, durations_path), _FakeConfig())
+
+        self._visit(
+            'test_known.py',
+            # a "flood" of ordinary source files nose also visits via wantFile(), none of which
+            # look test-like and none of which are (or ever would be) in the durations table
+            'helpers.py', '__init__.py', 'utils.py', 'models.py', 'views.py', 'serializers.py',
+            'urls.py', 'admin.py', 'forms.py', 'managers.py',
+        )
+        self.logger_handler.messages = []
+        self.plugin.report(None)
+
+        self.assertFalse(
+            any('durations cache may be stale' in msg for msg in self.logger_handler.messages),
+            self.logger_handler.messages,
+        )
 
 
 if __name__ == '__main__':
