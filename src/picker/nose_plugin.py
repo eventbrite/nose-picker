@@ -34,10 +34,7 @@ import hashlib
 import json
 import logging
 import os
-import re
 import site
-import stat
-import sys
 
 from nose.plugins import Plugin
 
@@ -84,113 +81,35 @@ def hash_filename(filename):
 
 
 # ---------------------------------------------------------------------------
-# Best-effort reimplementation of nose's *default* file-discovery convention
-# (nose.selector.Selector.wantFile / wantDirectory, nose.util.ispackage, and
-# nose.config.Config's built-in ignoreFiles/testMatch/srcDirs), used only to
-# build the complete candidate-file list up front for --file-durations
-# bin-packing. This intentionally mirrors nose 1.3.7's defaults; it does NOT
-# know about custom --match/--include/--exclude regexes, or directory
-# exclusions contributed by other plugins (e.g. nose-exclude's --exclude-dir)
-# on top of those defaults. See README for the known gap this leaves.
-# ---------------------------------------------------------------------------
-
-_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-_DEFAULT_TESTMATCH_RE = re.compile(r'(?:^|[\b_\.%s-])[Tt]est' % os.sep)
-_DEFAULT_IGNORE_FILE_RES = (
-    re.compile(r'^\.'),
-    re.compile(r'^_'),
-    re.compile(r'^setup\.py$'),
-)
-_DEFAULT_SRC_DIRS = ('lib', 'src')
-_EXE_ALLOWED_PLATFORMS = ('win32', 'cli')
-
-
-def _is_package_dir(path):
-    end = os.path.basename(path)
-    if not _IDENT_RE.match(end):
-        return False
-    for init in ('__init__.py', '__init__.pyc', '__init__.pyo'):
-        if os.path.isfile(os.path.join(path, init)):
-            return True
-    return False
-
-
-def _is_executable(path):
-    try:
-        st = os.stat(path)
-    except OSError:
-        return False
-    return bool(st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
-
-
-def _wants_file(basename, fullpath):
-    for ignore_re in _DEFAULT_IGNORE_FILE_RES:
-        if ignore_re.search(basename):
-            return False
-    if sys.platform not in _EXE_ALLOWED_PLATFORMS and _is_executable(fullpath):
-        return False
-    if not basename.endswith('.py'):
-        return False
-    return bool(_DEFAULT_TESTMATCH_RE.search(basename))
-
-
-def _wants_directory(basename, fullpath):
-    if _is_package_dir(fullpath):
-        return True
-    return bool(_DEFAULT_TESTMATCH_RE.search(basename)) or basename in _DEFAULT_SRC_DIRS
-
-
-def discover_candidate_files(root):
-    '''Walk `root` and return the list of full paths for every file that
-    nose's *default* discovery convention would hand to wantFile -- i.e. the
-    complete candidate set that --which-process/--total-processes selection
-    has always operated over one file at a time, without ever seeing the
-    full list.
-
-    Dedupes by os.path.realpath() at both directory and file granularity, so
-    a symlink (a symlinked directory anywhere on the path, or a direct
-    symlink to a file) can never produce two separate entries for what's
-    really the same underlying file -- exactly the same realpath-based
-    identity hash_filename()/_relative_key() already use elsewhere in this
-    module, applied here too so callers never see duplicate candidates.
-    '''
-    root = os.path.realpath(root)
-    candidates = []
-    visited_dirs = set()
-    visited_files = set()
-
-    def _walk(path):
-        real = os.path.realpath(path)
-        if real in visited_dirs:
-            return
-        visited_dirs.add(real)
-        try:
-            entries = sorted(os.listdir(path))
-        except OSError:
-            return
-        for entry in entries:
-            if entry.startswith('.'):
-                continue
-            entry_path = os.path.join(path, entry)
-            if os.path.isfile(entry_path):
-                if _wants_file(entry, entry_path):
-                    real_file = os.path.realpath(entry_path)
-                    if real_file in visited_files:
-                        continue
-                    visited_files.add(real_file)
-                    candidates.append(entry_path)
-            elif os.path.isdir(entry_path):
-                if entry.startswith('_'):
-                    continue
-                if _wants_directory(entry, entry_path):
-                    _walk(entry_path)
-
-    _walk(root)
-    return candidates
-
-
-# ---------------------------------------------------------------------------
 # Duration-aware bin-packing (LPT: longest processing time first).
+#
+# Design note: nose-picker deliberately does NOT do its own filesystem walk
+# to build a candidate-file list. An earlier version of this feature did --
+# reimplementing nose's default discovery convention (testMatch/ignoreFiles/
+# srcDirs/package detection) well enough to build a complete file list up
+# front, since nose's own wantFile() plugin hook only ever hands files over
+# one at a time, as nose's own real walk discovers them. That reimplementation
+# risked silently diverging from nose's actual behavior (custom --match/
+# --include/--exclude regexes, other plugins' directory exclusions, subtle
+# edge cases) -- a mismatch there means some file nose really does visit
+# never appearing in *any* shard's assigned set, which is a correctness bug,
+# not just a balance one.
+#
+# Instead: nose's own real discovery keeps driving everything exactly as it
+# always has (wantFile() is still called once per file, one at a time, as
+# nose's own Loader/Selector finds it -- nose-picker never walks anything
+# itself). The candidate set used for bin-packing is simply the key set of
+# the --file-durations table itself: real ground truth captured from an
+# actual prior nose run's junit output (see eventbrite/core's CI wiring),
+# not a guess about what nose would discover. Bin-packing happens once, in
+# configure(), over that known key set. As nose's real walk then calls
+# wantFile() file by file, _should_run() looks the file up in the
+# precomputed assignment; a file nose visits that ISN'T in that known set
+# (new since the durations table was last refreshed, or the table doesn't
+# cover it for any other reason) falls back to the classic hash for that one
+# file -- the same safety net as the "unknown file" case, but now the
+# *expected*, routine path for new files rather than a reimplementation-bug
+# escape hatch.
 # ---------------------------------------------------------------------------
 
 def _median(values):
@@ -251,7 +170,12 @@ def _bin_pack_files(candidate_keys, durations, total_processes, logger, stale_th
 
     Files with no entry in `durations` are weighted with the median of all
     known durations, and a warning is logged if too large a fraction of the
-    candidate set is unknown (a sign the durations table is stale).
+    candidate set is unknown (a sign the durations table is stale). In
+    practice `candidate_keys` is normally exactly `durations.keys()` (see the
+    module docstring above), so this path rarely triggers today -- it's kept
+    general because it's also independently unit-tested, and because a
+    caller passing a candidate set that only partially overlaps `durations`
+    is a perfectly reasonable thing to support.
 
     NOTE: this only balances at file granularity. A single very slow test
     file can never be split across bins, so no bin-packing scheme built on
@@ -275,7 +199,7 @@ def _bin_pack_files(candidate_keys, durations, total_processes, logger, stale_th
         # improve on. Signal "can't bin-pack" to the caller so it falls back
         # to classic hash-based selection instead.
         logger.warning(
-            'nose-picker: no usable durations found among %d discovered test '
+            'nose-picker: no usable durations found among %d candidate test '
             'files; falling back to hash-based file selection.',
             len(candidate_keys),
         )
@@ -288,7 +212,7 @@ def _bin_pack_files(candidate_keys, durations, total_processes, logger, stale_th
         stale_fraction = len(missing) / float(len(candidate_keys))
         if stale_fraction > stale_threshold:
             logger.warning(
-                'nose-picker: %d/%d discovered test files (%.0f%%) have no entry '
+                'nose-picker: %d/%d candidate test files (%.0f%%) have no entry '
                 'in the --file-durations table and are being weighted with the '
                 'median known duration (%.3fs); the durations cache may be stale.',
                 len(missing), len(candidate_keys), stale_fraction * 100.0, fallback_weight,
@@ -328,7 +252,9 @@ class NosePicker(Plugin):
         self.enableOpt = 'with-nose-picker'
         self.logger = logging.getLogger('nose.plugins.picker')
         self._assigned_files = None
-        self._all_candidate_keys = frozenset()
+        self._known_keys = frozenset()
+        self._known_hits = 0
+        self._unknown_hits = 0
 
     def options(self, parser, env=os.environ):
         parser.add_option(
@@ -358,11 +284,12 @@ class NosePicker(Plugin):
                 'nose-picker: Optional path to a JSON file mapping relative test '
                 'file paths (the same convention hash_filename() strips paths '
                 'down to) to their most recent total run duration in seconds. '
-                'When given a valid file, nose-picker bin-packs the full set of '
-                'discovered test files across --total-processes bins by duration '
-                '(greedy LPT) instead of hashing filenames. If this flag is '
-                'omitted, or the file is missing/unreadable/invalid, behavior is '
-                'unchanged from the classic hash-modulo selection.'
+                'When given a valid file, nose-picker bin-packs that file set '
+                'across --total-processes bins by duration (greedy LPT) instead '
+                'of hashing filenames; files nose visits that this run\'s table '
+                'doesn\'t cover still fall back to the hash individually. If this '
+                'flag is omitted, or the file is missing/unreadable/invalid, '
+                'behavior is unchanged from the classic hash-modulo selection.'
             ),
         )
         super(NosePicker, self).options(parser, env=env)
@@ -372,7 +299,9 @@ class NosePicker(Plugin):
         self.total_processes = options.total_processes
         self.which_process = options.which_process
         self._assigned_files = None
-        self._all_candidate_keys = frozenset()
+        self._known_keys = frozenset()
+        self._known_hits = 0
+        self._unknown_hits = 0
 
         if options.futz_with_django:
             import django
@@ -392,10 +321,10 @@ class NosePicker(Plugin):
 
         file_durations_path = getattr(options, 'file_durations', None)
         if self.enabled and file_durations_path:
-            # Anything going wrong here -- a bad walk, an unreadable path, a
-            # bug in the bin-packer -- must degrade to the classic hash
-            # behavior, never take the whole test run down. This is the
-            # backward-compat guarantee for everyone who hasn't opted in.
+            # Anything going wrong here -- an unreadable path, a bug in the
+            # bin-packer -- must degrade to the classic hash behavior, never
+            # take the whole test run down. This is the backward-compat
+            # guarantee for everyone who hasn't opted in.
             try:
                 self._configure_file_durations(file_durations_path)
             except Exception:
@@ -405,7 +334,7 @@ class NosePicker(Plugin):
                     'selection.', file_durations_path, exc_info=True,
                 )
                 self._assigned_files = None
-                self._all_candidate_keys = frozenset()
+                self._known_keys = frozenset()
 
         super(NosePicker, self).configure(options, config)
 
@@ -414,18 +343,10 @@ class NosePicker(Plugin):
         if durations is None:
             return
 
-        # discover_candidate_files() already dedupes by os.path.realpath() at both directory and
-        # file granularity (see its docstring), so a symlink and its target can never appear as
-        # two separate entries here -- each candidate_keys entry (itself realpath-derived, via
-        # _relative_key()) is guaranteed unique. That invariant matters: without it,
-        # _bin_pack_files could place two occurrences of what's really one physical file into
-        # different bins, and two shards would each believe they own it and both run it. Legacy
-        # hash mode never had this failure mode (hash_filename() is realpath-based too, so a
-        # symlink and its target always hash identically and land on one shard together) --
-        # duration mode needs to preserve that same guarantee itself, which is what
-        # discover_candidate_files()'s dedup is for.
-        candidate_paths = discover_candidate_files(os.getcwd())
-        candidate_keys = [_relative_key(path) for path in candidate_paths]
+        # The candidate set is exactly the durations table's own keys -- real ground truth from
+        # an actual prior nose run (see the module docstring above for why nose-picker doesn't do
+        # its own filesystem walk to build this list instead).
+        candidate_keys = sorted(durations.keys())
 
         if not (0 <= self.which_process < self.total_processes):
             self.logger.warning(
@@ -444,10 +365,10 @@ class NosePicker(Plugin):
             # so _should_run() falls back to hash-based selection for this run.
             return
         self._assigned_files = frozenset(bins[self.which_process])
-        self._all_candidate_keys = frozenset(candidate_keys)
+        self._known_keys = frozenset(candidate_keys)
         self.logger.info(
             'nose-picker: --file-durations bin-packing active; process %d/%d '
-            'assigned %d of %d discovered files, totalling %.1fs (all bin '
+            'assigned %d of %d known files, totalling %.1fs (all bin '
             'totals: %s)',
             self.which_process, self.total_processes,
             len(bins[self.which_process]), len(candidate_keys),
@@ -465,16 +386,16 @@ class NosePicker(Plugin):
         if self.enabled:
             if self._assigned_files is not None:
                 key = _relative_key(name)
-                if key in self._all_candidate_keys:
+                if key in self._known_keys:
+                    self._known_hits += 1
                     if key in self._assigned_files:
                         return None
                     return False
-                # This file exists (nose is asking about it) but our own
-                # upfront walk didn't enumerate it -- e.g. it was added after
-                # configure() ran, or our reimplementation of nose's
-                # discovery conventions missed a case. Fall back to the hash
-                # for this one file so it still runs in exactly one shard
-                # instead of silently vanishing from all of them.
+                # nose is visiting a file this run's durations table doesn't know about (new
+                # since the table was last refreshed, or the table doesn't cover it for any
+                # other reason). Fall back to the hash for this one file so it still runs in
+                # exactly one shard rather than vanishing from all of them.
+                self._unknown_hits += 1
                 return self._hash_should_run(name)
             return self._hash_should_run(name)
 
@@ -485,3 +406,21 @@ class NosePicker(Plugin):
         if hashed_value == self.which_process:
             return None
         return False
+
+    def report(self, stream):
+        """Log a one-time staleness summary once collection is complete, since (unlike an
+        earlier version of this feature) nose-picker no longer has an upfront full candidate
+        list to compare the durations table against -- it only learns "known" vs "unknown" as
+        nose's own real walk visits each file live. See module docstring for why.
+        """
+        total_hits = self._known_hits + self._unknown_hits
+        if self._assigned_files is not None and total_hits and self._unknown_hits:
+            unknown_fraction = self._unknown_hits / float(total_hits)
+            if unknown_fraction > 0.30:
+                self.logger.warning(
+                    'nose-picker: %d/%d files nose visited this run (%.0f%%) had no entry '
+                    'in the --file-durations table and fell back to hash-based selection '
+                    'individually; the durations cache may be stale.',
+                    self._unknown_hits, total_hits, unknown_fraction * 100.0,
+                )
+        return None

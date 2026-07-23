@@ -38,17 +38,39 @@ where ``durations.json`` looks like::
 (keys are relative paths using the same "strip the cwd/site-packages prefix"
 convention ``hash_filename()`` has always used).
 
-When given a valid file, nose-picker walks the current working directory
-once, up front (during nose's plugin ``configure()`` step, before test
-collection starts), building the same file candidate list nose's own default
-discovery convention would produce, and greedily bin-packs those files across
-``--total-processes`` bins by descending duration (longest processing time
-first), so each shard ends up with roughly the same *total* runtime instead
-of roughly the same file count. Files with no entry in the durations table
-are weighted with the median of all known durations, and a warning is logged
-(via the ``nose.plugins.picker`` logger) if too large a fraction of the
-discovered files are missing from the table, since that's a sign the table
-has gone stale.
+When given a valid file, nose-picker does **not** try to rediscover your test
+files itself. Instead, in nose's plugin ``configure()`` step (before test
+collection starts), it bin-packs the durations table's own set of files --
+real ground truth captured from an actual prior nose run's output, not a
+guess -- across ``--total-processes`` bins by descending duration (longest
+processing time first), so each shard ends up with roughly the same *total*
+runtime instead of roughly the same file count. Nose's own real
+discovery keeps driving everything else exactly as before: it still calls
+this plugin's ``wantFile()`` hook once per file, one at a time, as its own
+``Loader``/``Selector`` finds each one. For a file the durations table
+already covers, ``wantFile()`` becomes a simple membership check against the
+precomputed assignment; for a file the table *doesn't* cover (new since the
+table was last refreshed, or any other reason), that one file falls back to
+the classic hash so it still runs in exactly one shard rather than
+vanishing from all of them. Files with no entry in the table are weighted
+with the median of all known durations at bin-packing time (if there aren't
+enough of them to make bin-packing meaningless -- see below), and a
+staleness warning is logged (via the ``nose.plugins.picker`` logger, at the
+end of the run, from nose's standard ``report()`` plugin hook) if too large
+a fraction of the files actually visited this run fell back to the hash
+individually, since that's a sign the table has gone stale.
+
+An earlier version of this feature had nose-picker walk the filesystem
+itself to build a candidate list, reimplementing nose's own default
+discovery convention (``testMatch``/``ignoreFiles``/``srcDirs``/package
+detection). That was dropped in favor of the design above: any mismatch
+between a hand-rolled reimplementation and nose's *actual* discovery
+behavior (custom ``--match``/``--include``/``--exclude`` regexes, other
+plugins' directory exclusions, subtle edge cases) risked a file nose really
+does visit never appearing in *any* shard's assigned set -- a correctness
+bug, not just a balance one. Deriving the candidate set from the durations
+table itself, and leaving 100% of real discovery to nose as it's always
+worked, removes that entire risk category.
 
 **Backward compatibility guarantee**: if ``--file-durations`` is not passed,
 or the given path doesn't exist, can't be read, or doesn't parse as JSON,

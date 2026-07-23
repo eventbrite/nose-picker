@@ -14,7 +14,6 @@ from picker.nose_plugin import (
     _load_durations_file,
     _median,
     _relative_key,
-    discover_candidate_files,
     hash_filename,
 )
 
@@ -43,6 +42,19 @@ def _make_options(which_process, total_processes, file_durations=None):
         'futz_with_django': False,
         'file_durations': file_durations,
     })
+
+
+class _ListHandler(logging.Handler):
+    """Captures emitted records' messages so tests can assert on logger.warning() calls
+    without depending on stderr/stdout capture.
+    """
+
+    def __init__(self):
+        logging.Handler.__init__(self)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
 
 
 class MedianTest(unittest.TestCase):
@@ -188,151 +200,31 @@ class HashFilenameBackwardCompatTest(unittest.TestCase):
         self.assertEqual(hash_filename(path), hash_filename('test_foo.py'))
 
 
-class DiscoverCandidateFilesTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self._make(['pkg/__init__.py'])
-        self._make(['pkg/test_foo.py'])
-        self._make(['pkg/bar_test.py'])
-        self._make(['pkg/helpers.py'])  # not test-like, must be excluded
-        self._make(['pkg/sub/__init__.py'])
-        self._make(['pkg/sub/test_deep.py'])
-        self._make(['lib/test_in_lib.py'])  # nose's srcDirs special case
-        self._make(['notpkg/test_should_not_appear.py'])  # non-package, non-testMatch dir
-        self._make(['_hidden/test_should_not_appear2.py'])  # leading underscore dir
-        self._make(['.dotdir/test_should_not_appear3.py'])  # leading dot dir
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
-
-    def _make(self, rel_parts):
-        full = os.path.join(self.tmp, *rel_parts)
-        d = os.path.dirname(full)
-        if not os.path.isdir(d):
-            os.makedirs(d)
-        open(full, 'w').close()
-
-    def test_matches_nose_default_conventions(self):
-        candidates = discover_candidate_files(self.tmp)
-        rels = sorted(_relative_key(c, cwd=self.tmp) for c in candidates)
-        self.assertEqual(rels, sorted([
-            '/lib/test_in_lib.py',
-            '/pkg/bar_test.py',
-            '/pkg/sub/test_deep.py',
-            '/pkg/test_foo.py',
-        ]))
-
-
-class NestedNonPackageDirectoryTest(unittest.TestCase):
-    """Regression coverage for a matching-semantics question raised (and empirically settled)
-    during review: does nose 1.3.7 apply testMatch against a directory's basename only, or
-    against the full path (which would let an already-matching ancestor segment like `tests/`
-    "cover" a non-matching, non-package child like `tests/unit/`)?
-
-    Verified directly against real nose 1.3.7 (not just by reading its source): a
-    `tests/unit/test_foo.py` layout where `unit` has no `__init__.py` and doesn't itself contain
-    "test" produces **zero** collected tests under plain `nosetests -v` -- nose's own
-    `Selector.wantDirectory` only ever inspects `os.path.basename(dirname)`
-    (`tail = op_basename(dirname); ... self.matches(tail)`), so a matching ancestor does *not*
-    rescue a non-matching, non-package child directory. This module's `_wants_directory` mirrors
-    that (basename-only) on purpose -- switching it to check the full path, as the regex's
-    inclusion of `os.sep` might suggest at a glance, would make discovery *more* permissive than
-    real nose and start bin-packing files nose itself would never actually collect.
-    """
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
-
-    def _make(self, rel_parts):
-        full = os.path.join(self.tmp, *rel_parts)
-        d = os.path.dirname(full)
-        if not os.path.isdir(d):
-            os.makedirs(d)
-        open(full, 'w').close()
-
-    def test_non_package_child_of_a_matching_dir_is_not_discovered(self):
-        # `tests` matches testMatch on its own basename; `unit` does not, and isn't a package.
-        self._make(['tests/unit/test_should_not_appear.py'])
-        candidates = discover_candidate_files(self.tmp)
-        self.assertEqual(candidates, [])
-
-    def test_package_child_of_a_matching_dir_is_discovered(self):
-        # Same layout, but `unit` (and `tests`) are now proper packages -- ispackage() alone is
-        # enough to recurse regardless of the directory's own name, in both real nose and here.
-        self._make(['tests/__init__.py'])
-        self._make(['tests/unit/__init__.py'])
-        self._make(['tests/unit/test_should_appear.py'])
-        candidates = discover_candidate_files(self.tmp)
-        rels = sorted(_relative_key(c, cwd=self.tmp) for c in candidates)
-        self.assertEqual(rels, ['/tests/unit/test_should_appear.py'])
-
-
-class SymlinkDedupTest(unittest.TestCase):
-    """Regression coverage: a symlink to a test file must not produce a second candidate for
-    what's really the same physical file. discover_candidate_files() dedupes by
-    os.path.realpath() at file granularity (mirroring the same realpath-based identity
-    hash_filename()/_relative_key() already use, and the same dedup discover_candidate_files()
-    already did for directories to guard against symlink cycles) -- without it, _bin_pack_files
-    could place the real file and its symlink into two different bins, and two shards would each
-    believe they own the file and both run it, unlike legacy hash mode (realpath-based, so a
-    symlink and its target always hash identically and land on one shard together).
-    """
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp)
-
-    def test_symlinked_file_does_not_duplicate_candidate(self):
-        real_path = os.path.join(self.tmp, 'test_real.py')
-        open(real_path, 'w').close()
-        symlink_path = os.path.join(self.tmp, 'test_symlink.py')
-        os.symlink(real_path, symlink_path)
-
-        candidates = discover_candidate_files(self.tmp)
-        # Two directory entries exist (test_real.py, test_symlink.py), but they're the same
-        # underlying file -- exactly one candidate, not two.
-        self.assertEqual(len(candidates), 1)
-
-    def test_symlinked_directory_does_not_duplicate_candidates(self):
-        real_dir = os.path.join(self.tmp, 'real_tests')
-        os.makedirs(real_dir)
-        open(os.path.join(real_dir, 'test_a.py'), 'w').close()
-        os.symlink(real_dir, os.path.join(self.tmp, 'test_symlinked_dir'))
-
-        candidates = discover_candidate_files(self.tmp)
-        self.assertEqual(len(candidates), 1)
-
-
 class FullShardCoverageTest(unittest.TestCase):
-    """End-to-end style checks: across every shard 0..N-1, every discovered
-    file must be claimed by exactly one shard -- in legacy hash mode, in
-    duration mode, and in every fallback path duration mode can take.
+    """End-to-end style checks: across every shard 0..N-1, every file nose's real walk visits
+    this run must be claimed by exactly one shard -- in legacy hash mode, in duration mode, and
+    in every fallback path duration mode can take.
+
+    nose-picker does not do its own filesystem walk (see the module docstring in
+    nose_plugin.py for why): the candidate set for bin-packing is just the --file-durations
+    table's own keys, and nose's real Loader/Selector keeps calling wantFile() one file at a
+    time exactly as it always did. So "files nose visits this run" here is simply a fixed list
+    of paths fed directly into _should_run(), one at a time, mirroring that -- there's no
+    filesystem convention to fake, and the files don't even need to exist on disk (this module's
+    path handling is pure os.path.realpath()-based string manipulation).
     """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.old_cwd = os.getcwd()
-        for rel in [
-            'pkg/__init__.py', 'pkg/test_foo.py', 'pkg/bar_test.py',
-            'pkg/helpers.py', 'pkg/sub/__init__.py', 'pkg/sub/test_deep.py',
-            'lib/test_in_lib.py',
-        ]:
-            full = os.path.join(self.tmp, rel)
-            d = os.path.dirname(full)
-            if not os.path.isdir(d):
-                os.makedirs(d)
-            open(full, 'w').close()
         os.chdir(self.tmp)
-        self.expected_keys = sorted(
-            _relative_key(c, cwd=self.tmp)
-            for c in discover_candidate_files(self.tmp)
-        )
-        self.assertEqual(len(self.expected_keys), 4)
+        self.files_this_run = [
+            os.path.join(self.tmp, 'pkg', 'test_foo.py'),
+            os.path.join(self.tmp, 'pkg', 'bar_test.py'),
+            os.path.join(self.tmp, 'pkg', 'sub', 'test_deep.py'),
+            os.path.join(self.tmp, 'lib', 'test_in_lib.py'),
+        ]
+        self.expected_keys = sorted(_relative_key(f, cwd=self.tmp) for f in self.files_this_run)
 
     def tearDown(self):
         os.chdir(self.old_cwd)
@@ -346,15 +238,16 @@ class FullShardCoverageTest(unittest.TestCase):
                 _make_options(which, total_processes, file_durations),
                 _FakeConfig(),
             )
-            for full_path in discover_candidate_files(self.tmp):
+            for full_path in self.files_this_run:
                 key = _relative_key(full_path, cwd=self.tmp)
                 wanted = plugin._should_run(full_path) is None
                 if wanted:
                     assignment.setdefault(key, []).append(which)
         return assignment
 
-    def _assert_bijection(self, assignment):
-        self.assertEqual(sorted(assignment.keys()), self.expected_keys)
+    def _assert_bijection(self, assignment, expected_keys=None):
+        expected_keys = self.expected_keys if expected_keys is None else expected_keys
+        self.assertEqual(sorted(assignment.keys()), sorted(expected_keys))
         for key, shards in assignment.items():
             self.assertEqual(len(shards), 1, 'file %s claimed by %r' % (key, shards))
 
@@ -370,18 +263,23 @@ class FullShardCoverageTest(unittest.TestCase):
         assignment = self._run_all_shards(3, file_durations=path)
         self._assert_bijection(assignment)
 
-    def test_duration_mode_stale_table_still_covers_everything(self):
+    def test_duration_mode_partially_known_still_covers_everything(self):
+        # Half the files this run visits are in the durations table (bin-packed), half are new
+        # (not in the table, e.g. added since it was last refreshed) and fall back to the hash
+        # individually. Every file must still land in exactly one shard either way.
+        known_keys = self.expected_keys[:2]
+        durations = dict((k, random.uniform(1, 100)) for k in known_keys)
         path = os.path.join(self.tmp, 'partial.json')
         with open(path, 'w') as fh:
-            json.dump({self.expected_keys[0]: 42.0}, fh)
+            json.dump(durations, fh)
         assignment = self._run_all_shards(3, file_durations=path)
         self._assert_bijection(assignment)
 
     def test_duration_mode_wholly_unmatched_table_falls_back_identically_to_legacy(self):
-        # Regression coverage for the all-unknown-durations collapse bug: a durations table that
-        # doesn't overlap the discovered candidate set at all (e.g. every path in it belongs to
-        # files that no longer exist) must fall back to hash-based selection -- not silently
-        # collapse the whole suite onto shard 0.
+        # A durations table that doesn't overlap the files visited this run at all (e.g. it only
+        # knows about files that no longer exist) means _should_run() treats every file visited
+        # this run as "unknown" and falls back to the hash for each -- byte-for-byte the same as
+        # legacy mode, not some degraded in-between state.
         path = os.path.join(self.tmp, 'wholly_unmatched.json')
         with open(path, 'w') as fh:
             json.dump({'/this/file/does/not/exist.py': 123.0}, fh)
@@ -411,6 +309,75 @@ class FullShardCoverageTest(unittest.TestCase):
         legacy = self._run_all_shards(3, file_durations=None)
         fallback = self._run_all_shards(3, file_durations=path)
         self.assertEqual(legacy, fallback)
+
+
+class ReportStalenessWarningTest(unittest.TestCase):
+    """The durations table is no longer compared against an upfront full candidate list (there
+    isn't one -- see module docstring), so staleness can only be observed live, as nose's real
+    walk visits each file one at a time. report() -- nose's standard end-of-run plugin hook --
+    logs a one-time summary warning if too large a fraction of *this run's actually-visited*
+    files fell back to hash-based selection individually.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.logger_handler = _ListHandler()
+        self.plugin = NosePicker()
+        self.plugin.logger.addHandler(self.logger_handler)
+        self.plugin.logger.setLevel(logging.DEBUG)
+
+    def tearDown(self):
+        self.plugin.logger.removeHandler(self.logger_handler)
+        os.chdir(self.old_cwd)
+        shutil.rmtree(self.tmp)
+
+    def _visit(self, *relnames):
+        for relname in relnames:
+            self.plugin._should_run(os.path.join(self.tmp, relname))
+
+    def test_mostly_unknown_files_this_run_warns_on_report(self):
+        durations_path = os.path.join(self.tmp, 'durations.json')
+        with open(durations_path, 'w') as fh:
+            json.dump({_relative_key(os.path.join(self.tmp, 'test_known.py'), cwd=self.tmp): 5.0}, fh)
+        self.plugin.configure(_make_options(0, 2, durations_path), _FakeConfig())
+
+        self._visit('test_known.py', 'test_new_a.py', 'test_new_b.py', 'test_new_c.py')
+        self.logger_handler.messages = []  # only care about what report() itself logs
+        self.plugin.report(None)
+
+        self.assertTrue(
+            any('durations cache may be stale' in msg for msg in self.logger_handler.messages),
+            self.logger_handler.messages,
+        )
+
+    def test_mostly_known_files_this_run_does_not_warn_on_report(self):
+        known_names = ['test_a.py', 'test_b.py', 'test_c.py', 'test_d.py']
+        durations = dict(
+            (_relative_key(os.path.join(self.tmp, name), cwd=self.tmp), 5.0)
+            for name in known_names
+        )
+        durations_path = os.path.join(self.tmp, 'durations.json')
+        with open(durations_path, 'w') as fh:
+            json.dump(durations, fh)
+        self.plugin.configure(_make_options(0, 2, durations_path), _FakeConfig())
+
+        self._visit(*known_names)
+        self.logger_handler.messages = []
+        self.plugin.report(None)
+
+        self.assertFalse(
+            any('durations cache may be stale' in msg for msg in self.logger_handler.messages),
+            self.logger_handler.messages,
+        )
+
+    def test_legacy_hash_mode_never_warns_on_report(self):
+        self.plugin.configure(_make_options(0, 2, None), _FakeConfig())
+        self._visit('test_a.py', 'test_b.py')
+        self.logger_handler.messages = []
+        self.plugin.report(None)
+        self.assertEqual(self.logger_handler.messages, [])
 
 
 if __name__ == '__main__':
